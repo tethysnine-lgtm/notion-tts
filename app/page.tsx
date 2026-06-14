@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { chunkText } from "@/app/lib/chunk";
 
 type NotionPage = {
   id: string;
@@ -249,9 +248,21 @@ export default function Home() {
     }
   }
 
-  /** 청크 하나를 ElevenLabs로 변환해 MP3 Blob을 반환 */
-  async function synthesizeChunk(text: string): Promise<Blob> {
+  /** 서버(/api/tts)에 전체 텍스트를 보내 청크 배열을 받아온다 */
+  async function fetchChunks(text: string): Promise<string[]> {
     const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    const data = await parseJsonOrThrow(res, "텍스트 분할에 실패했습니다.");
+    const chunks: string[] = Array.isArray(data.chunks) ? data.chunks : [];
+    return chunks;
+  }
+
+  /** 청크 하나를 /api/tts/chunk 로 보내 MP3 Blob을 받는다 */
+  async function synthesizeChunk(text: string): Promise<Blob> {
+    const res = await fetch("/api/tts/chunk", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
@@ -273,8 +284,10 @@ export default function Home() {
     return blob;
   }
 
-  // 3단계: TTS 변환 — 클라이언트에서 청크로 나눠 순차 호출(요청당 1청크).
-  // Vercel 무료 플랜의 10초 타임아웃을 피하고, 청크별로 즉시 재생 가능하게 한다.
+  // 3단계: TTS 변환
+  // (1) /api/tts 에 전체 텍스트를 보내 서버에서 청크로 분할한 배열을 받는다.
+  // (2) 받은 청크 배열을 /api/tts/chunk 로 순차 호출(요청당 1청크)해 MP3를 모은다.
+  // 요청당 단일 합성이라 Vercel 무료 플랜의 10초 타임아웃을 피한다.
   async function handleTTS() {
     const target = processedText.trim();
     if (!target) {
@@ -282,15 +295,25 @@ export default function Home() {
       return;
     }
 
-    const chunks = chunkText(target);
-    if (chunks.length === 0) {
-      setError("변환할 텍스트가 없습니다.");
+    setError("");
+    setBusy("tts");
+
+    let chunks: string[];
+    try {
+      chunks = await fetchChunks(target);
+    } catch (e) {
+      setError(describeError(e, "tts:split"));
+      setBusy(null);
       return;
     }
 
-    setError("");
+    if (chunks.length === 0) {
+      setError("변환할 텍스트가 없습니다.");
+      setBusy(null);
+      return;
+    }
+
     clearAudio();
-    setBusy("tts");
     setTtsProgress({ done: 0, total: chunks.length });
 
     const urls: string[] = [];
