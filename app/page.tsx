@@ -87,8 +87,6 @@ export default function Home() {
     done: number;
     total: number;
   } | null>(null);
-  // 다운로드용 병합 blob URL (모든 청크를 이어붙인 것)
-  const [downloadUrl, setDownloadUrl] = useState("");
 
   // 상태
   const [busy, setBusy] = useState<null | "fetch" | "preprocess" | "tts">(null);
@@ -158,7 +156,6 @@ export default function Home() {
     createdUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     createdUrlsRef.current = [];
     setAudioUrls([]);
-    setDownloadUrl("");
     setCurrentChunk(0);
     setIsPlaying(false);
     setTtsProgress(null);
@@ -317,13 +314,13 @@ export default function Home() {
     setTtsProgress({ done: 0, total: chunks.length });
 
     const urls: string[] = [];
-    const blobs: Blob[] = [];
 
     try {
       for (let i = 0; i < chunks.length; i++) {
         const blob = await synthesizeChunk(chunks[i]);
-        blobs.push(blob);
 
+        // 청크별 개별 MP3 URL을 유지한다.
+        // (여러 MP3를 단순 이어붙이면 파일이 손상되므로 병합하지 않는다.)
         const url = URL.createObjectURL(blob);
         createdUrlsRef.current.push(url);
         urls.push(url);
@@ -332,21 +329,9 @@ export default function Home() {
         setAudioUrls([...urls]);
         setTtsProgress({ done: i + 1, total: chunks.length });
       }
-
-      // 모든 청크를 이어붙인 다운로드용 단일 Blob 생성
-      const merged = new Blob(blobs, { type: "audio/mpeg" });
-      const mergedUrl = URL.createObjectURL(merged);
-      createdUrlsRef.current.push(mergedUrl);
-      setDownloadUrl(mergedUrl);
     } catch (e) {
-      setError(describeError(e, "tts"));
       // 일부라도 변환됐으면 그 청크들은 남겨 재생/다운로드 가능하게 둔다
-      if (urls.length > 0) {
-        const merged = new Blob(blobs, { type: "audio/mpeg" });
-        const mergedUrl = URL.createObjectURL(merged);
-        createdUrlsRef.current.push(mergedUrl);
-        setDownloadUrl(mergedUrl);
-      }
+      setError(describeError(e, "tts"));
     } finally {
       setBusy(null);
       setTtsProgress(null);
@@ -375,10 +360,17 @@ export default function Home() {
     }
   }
 
-  const downloadName = useMemo(() => {
+  // 파일명 베이스 (확장자/번호 제외)
+  const downloadBase = useMemo(() => {
     const base = (pageTitle || "tts").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
-    return `${base || "tts"}.mp3`;
+    return base || "tts";
   }, [pageTitle]);
+
+  /** 청크별 다운로드 파일명. 단일 청크면 번호를 붙이지 않는다. */
+  function chunkFileName(index: number) {
+    if (audioUrls.length <= 1) return `${downloadBase}.mp3`;
+    return `${downloadBase}_${index + 1}.mp3`;
+  }
 
   return (
     <main className="mx-auto max-w-2xl px-4 pb-24 pt-6 sm:pt-10">
@@ -555,8 +547,7 @@ export default function Home() {
           <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
             {chunkCount > 1 && (
               <p className="mb-3 text-xs text-slate-400">
-                긴 텍스트를 {chunkCount}개 구간으로 나눠 변환했습니다. 재생 중:{" "}
-                {currentChunk + 1}/{chunkCount} 구간
+                긴 텍스트를 {chunkCount}개 구간으로 나눠 변환했습니다.
               </p>
             )}
             <audio
@@ -578,7 +569,15 @@ export default function Home() {
               </button>
 
               <div className="flex-1">
-                <p className="mb-2 text-sm font-medium">재생 속도</p>
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-sm font-medium">재생 속도</p>
+                  {chunkCount > 1 && (
+                    <span className="text-xs font-medium text-blue-600 dark:text-blue-400">
+                      {isPlaying ? "▶ 재생 중" : "일시정지"} ·{" "}
+                      {currentChunk + 1}/{chunkCount} 구간
+                    </span>
+                  )}
+                </div>
                 <div className="flex flex-wrap gap-2">
                   {SPEED_OPTIONS.map((s) => (
                     <button
@@ -597,16 +596,28 @@ export default function Home() {
               </div>
             </div>
 
-            {/* 다운로드 (전체 청크 병합본) */}
-            {downloadUrl && (
-              <a
-                href={downloadUrl}
-                download={downloadName}
-                className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300 py-3 text-base font-semibold transition hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                ⬇️ MP3 다운로드
-              </a>
-            )}
+            {/* 다운로드 — 청크별 개별 MP3 (병합 시 파일이 손상되므로 분리 제공) */}
+            <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-700">
+              <p className="mb-2 text-sm font-medium text-slate-500">
+                {chunkCount > 1 ? "구간별 MP3 다운로드" : "MP3 다운로드"}
+              </p>
+              <div className="space-y-2">
+                {audioUrls.map((url, i) => (
+                  <a
+                    key={url}
+                    href={url}
+                    download={chunkFileName(i)}
+                    className={`flex w-full items-center justify-center gap-2 rounded-xl border py-3 text-base font-semibold transition hover:bg-slate-50 dark:hover:bg-slate-800 ${
+                      i === currentChunk
+                        ? "border-blue-400 dark:border-blue-700"
+                        : "border-slate-300 dark:border-slate-700"
+                    }`}
+                  >
+                    ⬇️ {chunkCount > 1 ? `${i + 1}번째 구간` : "MP3"} 다운로드
+                  </a>
+                ))}
+              </div>
+            </div>
           </div>
         )}
       </Section>
