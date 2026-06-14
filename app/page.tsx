@@ -13,6 +13,58 @@ type InputMode = "url" | "list";
 
 const SPEED_OPTIONS = [1, 1.25, 1.5, 1.75, 2];
 
+/**
+ * 응답을 안전하게 JSON으로 파싱한다.
+ * Vercel에서 서버리스 함수가 타임아웃(504)되거나 크래시하면 JSON이 아닌
+ * HTML 에러 페이지가 돌아오는데, 그대로 res.json()을 호출하면 throw 되어
+ * "Unexpected token '<'…" 같은 알 수 없는 에러가 표시된다.
+ * 이를 방지하고 상태 코드별로 의미 있는 메시지를 만들어 던진다.
+ */
+async function parseJsonOrThrow(res: Response, fallbackMsg: string) {
+  const raw = await res.text();
+  let data: any = null;
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      // JSON이 아님 (HTML 에러 페이지 등)
+    }
+  }
+
+  if (!res.ok) {
+    if (data?.error) throw new Error(data.error);
+    if (res.status === 504) {
+      throw new Error(
+        "서버 응답 시간이 초과되었습니다(504). 텍스트가 너무 길거나 서버가 지연되고 있습니다. 잠시 후 다시 시도하세요."
+      );
+    }
+    if (res.status === 413) {
+      throw new Error("요청 데이터가 너무 큽니다(413). 텍스트 분량을 줄여보세요.");
+    }
+    throw new Error(`${fallbackMsg} (HTTP ${res.status})`);
+  }
+
+  if (data === null) {
+    throw new Error("서버가 올바른 응답을 반환하지 않았습니다.");
+  }
+  return data;
+}
+
+/** 에러를 콘솔에 기록하고 사용자에게 보여줄 메시지를 반환한다. */
+function describeError(e: unknown, context: string): string {
+  // 콘솔에 상세 정보 출력 (디버깅용)
+  console.error(`[${context}] 요청 실패:`, e);
+
+  if (e instanceof TypeError) {
+    // fetch 자체가 실패 (네트워크 끊김, CORS, DNS 등)
+    return "서버에 연결하지 못했습니다. 네트워크 상태를 확인하세요.";
+  }
+  if (e instanceof Error && e.message) {
+    return e.message;
+  }
+  return "알 수 없는 오류가 발생했습니다.";
+}
+
 export default function Home() {
   const [mode, setMode] = useState<InputMode>("url");
 
@@ -75,11 +127,10 @@ export default function Home() {
     setError("");
     try {
       const res = await fetch("/api/notion");
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "목록을 불러오지 못했습니다.");
+      const data = await parseJsonOrThrow(res, "목록을 불러오지 못했습니다.");
       setPages(data.pages || []);
-    } catch (e: any) {
-      setError(e.message);
+    } catch (e) {
+      setError(describeError(e, "notion:list"));
     } finally {
       setPagesLoading(false);
     }
@@ -121,12 +172,11 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "내용을 가져오지 못했습니다.");
+      const data = await parseJsonOrThrow(res, "내용을 가져오지 못했습니다.");
       setRawText(data.text || "");
       setPageTitle(data.title || "");
-    } catch (e: any) {
-      setError(e.message);
+    } catch (e) {
+      setError(describeError(e, "notion:fetch"));
     } finally {
       setBusy(null);
     }
@@ -147,11 +197,13 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: rawText }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "전처리에 실패했습니다.");
-      setProcessedText(data.processed || "");
-    } catch (e: any) {
-      setError(e.message);
+      const data = await parseJsonOrThrow(res, "전처리에 실패했습니다.");
+      if (!data.processed) {
+        throw new Error("전처리 결과가 비어 있습니다.");
+      }
+      setProcessedText(data.processed);
+    } catch (e) {
+      setError(describeError(e, "preprocess"));
     } finally {
       setBusy(null);
     }
@@ -176,15 +228,24 @@ export default function Home() {
         body: JSON.stringify({ text: target }),
       });
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || "음성 변환에 실패했습니다.");
+        const data = await res.json().catch(() => ({} as any));
+        if (data.error) throw new Error(data.error);
+        if (res.status === 504) {
+          throw new Error(
+            "음성 변환 시간이 초과되었습니다(504). 텍스트가 길면 시간이 더 걸립니다. 잠시 후 다시 시도하세요."
+          );
+        }
+        throw new Error(`음성 변환에 실패했습니다. (HTTP ${res.status})`);
       }
       setChunkCount(Number(res.headers.get("X-Chunk-Count") || "1"));
       const blob = await res.blob();
+      if (blob.size === 0) {
+        throw new Error("변환된 오디오가 비어 있습니다.");
+      }
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
-    } catch (e: any) {
-      setError(e.message);
+    } catch (e) {
+      setError(describeError(e, "tts"));
     } finally {
       setBusy(null);
     }
@@ -346,9 +407,10 @@ export default function Home() {
         <BigButton
           onClick={handleTTS}
           loading={busy === "tts"}
+          loadingLabel="변환 중… (분량에 따라 시간 소요)"
           disabled={busy !== null || !processedText.trim()}
         >
-          {busy === "tts" ? "변환 중… (분량에 따라 시간 소요)" : "🔊 음성 만들기"}
+          🔊 음성 만들기
         </BigButton>
 
         {audioUrl && (
@@ -466,12 +528,14 @@ function TabButton({
 function BigButton({
   onClick,
   loading,
+  loadingLabel = "처리 중…",
   disabled,
   className = "",
   children,
 }: {
   onClick: () => void;
   loading?: boolean;
+  loadingLabel?: string;
   disabled?: boolean;
   className?: string;
   children: React.ReactNode;
@@ -480,9 +544,42 @@ function BigButton({
     <button
       onClick={onClick}
       disabled={disabled}
-      className={`w-full rounded-xl bg-blue-600 py-4 text-base font-semibold text-white shadow-md transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40 ${className}`}
+      aria-busy={loading || undefined}
+      className={`flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 py-4 text-base font-semibold text-white shadow-md transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40 ${className}`}
     >
-      {loading ? "처리 중…" : children}
+      {loading ? (
+        <>
+          <Spinner />
+          <span>{loadingLabel}</span>
+        </>
+      ) : (
+        children
+      )}
     </button>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg
+      className="h-5 w-5 animate-spin text-white"
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle
+        className="opacity-25"
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeWidth="4"
+      />
+      <path
+        className="opacity-90"
+        fill="currentColor"
+        d="M4 12a8 8 0 018-8V0C5.37 0 0 5.37 0 12h4z"
+      />
+    </svg>
   );
 }

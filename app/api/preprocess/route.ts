@@ -84,9 +84,23 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ processed });
   } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message ?? "전처리 중 오류가 발생했습니다." },
-      { status: 500 }
-    );
+    // Vercel 함수 로그(Runtime Logs)에 상세 정보 기록
+    console.error("[/api/preprocess] 오류:", {
+      name: err?.name,
+      message: err?.message,
+      status: err?.status,
+      stack: err?.stack,
+    });
+
+    // Anthropic SDK 에러는 상태 코드를 그대로 반영해 의미 있는 메시지를 전달
+    const status = typeof err?.status === "number" ? err.status : 500;
+    const message =
+      status === 401
+        ? "ANTHROPIC_API_KEY가 올바르지 않습니다."
+        : status === 429
+          ? "요청이 많아 잠시 후 다시 시도해야 합니다(429)."
+          : (err?.message ?? "전처리 중 오류가 발생했습니다.");
+
+    return NextResponse.json({ error: message }, { status });
   }
 }
