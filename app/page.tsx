@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { chunkText } from "@/app/lib/chunk";
 
 type NotionPage = {
   id: string;
@@ -78,8 +79,17 @@ export default function Home() {
   const [rawText, setRawText] = useState("");
   const [pageTitle, setPageTitle] = useState("");
   const [processedText, setProcessedText] = useState("");
-  const [audioUrl, setAudioUrl] = useState("");
-  const [chunkCount, setChunkCount] = useState(0);
+
+  // 오디오 (청크별 blob URL을 순서대로 보관)
+  const [audioUrls, setAudioUrls] = useState<string[]>([]);
+  const [currentChunk, setCurrentChunk] = useState(0);
+  // 변환 진행 상황: { done: 변환 완료 수, total: 전체 청크 수 }
+  const [ttsProgress, setTtsProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
+  // 다운로드용 병합 blob URL (모든 청크를 이어붙인 것)
+  const [downloadUrl, setDownloadUrl] = useState("");
 
   // 상태
   const [busy, setBusy] = useState<null | "fetch" | "preprocess" | "tts">(null);
@@ -89,6 +99,11 @@ export default function Home() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
+
+  // 생성한 모든 objectURL을 추적해 정리(메모리 누수 방지)
+  const createdUrlsRef = useRef<string[]>([]);
+
+  const chunkCount = audioUrls.length;
 
   // 다크모드 토글
   const [dark, setDark] = useState(false);
@@ -109,18 +124,46 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
-  // 재생 속도 반영
+  // 재생 속도 반영 (청크가 바뀌어도 유지)
   useEffect(() => {
     if (audioRef.current) audioRef.current.playbackRate = speed;
-  }, [speed, audioUrl]);
+  }, [speed, currentChunk, audioUrls]);
 
-  // 언마운트 시 objectURL 정리
+  // 현재 청크가 바뀌면 src를 교체해 이어 재생.
+  // 변환 진행으로 audioUrls가 늘어나도, 현재 재생 중인 청크의 src는
+  // 건드리지 않도록 가드를 둬 재생이 끊기지 않게 한다.
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a || audioUrls.length === 0) return;
+    const desired = audioUrls[currentChunk] ?? "";
+    if (desired && a.src !== desired) {
+      a.src = desired;
+      a.playbackRate = speed;
+      if (isPlaying) {
+        a.play().catch(() => setIsPlaying(false));
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChunk, audioUrls]);
+
+  // 언마운트 시 생성한 모든 objectURL 정리
   useEffect(() => {
     return () => {
-      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      createdUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+      createdUrlsRef.current = [];
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audioUrl]);
+  }, []);
+
+  /** 지금까지 만든 모든 오디오 objectURL을 해제하고 재생 상태를 초기화 */
+  function clearAudio() {
+    createdUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    createdUrlsRef.current = [];
+    setAudioUrls([]);
+    setDownloadUrl("");
+    setCurrentChunk(0);
+    setIsPlaying(false);
+    setTtsProgress(null);
+  }
 
   async function loadPages() {
     setPagesLoading(true);
@@ -138,10 +181,7 @@ export default function Home() {
 
   function resetResults() {
     setProcessedText("");
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioUrl("");
-    setChunkCount(0);
-    setIsPlaying(false);
+    clearAudio();
   }
 
   // 1단계: 노션에서 내용 가져오기
@@ -209,55 +249,106 @@ export default function Home() {
     }
   }
 
-  // 3단계: TTS 변환
+  /** 청크 하나를 ElevenLabs로 변환해 MP3 Blob을 반환 */
+  async function synthesizeChunk(text: string): Promise<Blob> {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}) as any);
+      if (data.error) throw new Error(data.error);
+      if (res.status === 504) {
+        throw new Error(
+          "음성 변환 시간이 초과되었습니다(504). 잠시 후 다시 시도하세요."
+        );
+      }
+      throw new Error(`음성 변환에 실패했습니다. (HTTP ${res.status})`);
+    }
+    const blob = await res.blob();
+    if (blob.size === 0) {
+      throw new Error("변환된 오디오가 비어 있습니다.");
+    }
+    return blob;
+  }
+
+  // 3단계: TTS 변환 — 클라이언트에서 청크로 나눠 순차 호출(요청당 1청크).
+  // Vercel 무료 플랜의 10초 타임아웃을 피하고, 청크별로 즉시 재생 가능하게 한다.
   async function handleTTS() {
     const target = processedText.trim();
     if (!target) {
       setError("변환할 텍스트가 없습니다.");
       return;
     }
+
+    const chunks = chunkText(target);
+    if (chunks.length === 0) {
+      setError("변환할 텍스트가 없습니다.");
+      return;
+    }
+
     setError("");
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioUrl("");
-    setIsPlaying(false);
+    clearAudio();
     setBusy("tts");
+    setTtsProgress({ done: 0, total: chunks.length });
+
+    const urls: string[] = [];
+    const blobs: Blob[] = [];
+
     try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: target }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({} as any));
-        if (data.error) throw new Error(data.error);
-        if (res.status === 504) {
-          throw new Error(
-            "음성 변환 시간이 초과되었습니다(504). 텍스트가 길면 시간이 더 걸립니다. 잠시 후 다시 시도하세요."
-          );
-        }
-        throw new Error(`음성 변환에 실패했습니다. (HTTP ${res.status})`);
+      for (let i = 0; i < chunks.length; i++) {
+        const blob = await synthesizeChunk(chunks[i]);
+        blobs.push(blob);
+
+        const url = URL.createObjectURL(blob);
+        createdUrlsRef.current.push(url);
+        urls.push(url);
+
+        // 변환된 청크를 즉시 재생 목록에 반영 (점진적 노출)
+        setAudioUrls([...urls]);
+        setTtsProgress({ done: i + 1, total: chunks.length });
       }
-      setChunkCount(Number(res.headers.get("X-Chunk-Count") || "1"));
-      const blob = await res.blob();
-      if (blob.size === 0) {
-        throw new Error("변환된 오디오가 비어 있습니다.");
-      }
-      const url = URL.createObjectURL(blob);
-      setAudioUrl(url);
+
+      // 모든 청크를 이어붙인 다운로드용 단일 Blob 생성
+      const merged = new Blob(blobs, { type: "audio/mpeg" });
+      const mergedUrl = URL.createObjectURL(merged);
+      createdUrlsRef.current.push(mergedUrl);
+      setDownloadUrl(mergedUrl);
     } catch (e) {
       setError(describeError(e, "tts"));
+      // 일부라도 변환됐으면 그 청크들은 남겨 재생/다운로드 가능하게 둔다
+      if (urls.length > 0) {
+        const merged = new Blob(blobs, { type: "audio/mpeg" });
+        const mergedUrl = URL.createObjectURL(merged);
+        createdUrlsRef.current.push(mergedUrl);
+        setDownloadUrl(mergedUrl);
+      }
     } finally {
       setBusy(null);
+      setTtsProgress(null);
     }
   }
 
   function togglePlay() {
     const a = audioRef.current;
-    if (!a) return;
+    if (!a || audioUrls.length === 0) return;
     if (a.paused) {
-      a.play();
+      // src가 비어 있으면 현재 청크를 로드
+      if (!a.src) a.src = audioUrls[currentChunk] ?? audioUrls[0];
+      a.play().catch(() => setIsPlaying(false));
     } else {
       a.pause();
+    }
+  }
+
+  // 현재 청크 재생이 끝나면 다음 청크로 이어 재생, 마지막이면 종료
+  function handleChunkEnded() {
+    if (currentChunk < audioUrls.length - 1) {
+      setCurrentChunk((i) => i + 1); // effect가 src 교체 후 자동 재생
+    } else {
+      setIsPlaying(false);
+      setCurrentChunk(0); // 처음으로 되감기
     }
   }
 
@@ -407,25 +498,49 @@ export default function Home() {
         <BigButton
           onClick={handleTTS}
           loading={busy === "tts"}
-          loadingLabel="변환 중… (분량에 따라 시간 소요)"
+          loadingLabel={
+            ttsProgress
+              ? `${ttsProgress.done}/${ttsProgress.total} 청크 변환 중…`
+              : "변환 준비 중…"
+          }
           disabled={busy !== null || !processedText.trim()}
         >
           🔊 음성 만들기
         </BigButton>
 
-        {audioUrl && (
+        {/* 변환 진행률 바 */}
+        {busy === "tts" && ttsProgress && (
+          <div className="mt-3">
+            <div className="mb-1 flex justify-between text-xs text-slate-500 dark:text-slate-400">
+              <span>음성 변환 중…</span>
+              <span>
+                {ttsProgress.done}/{ttsProgress.total} 청크
+              </span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+              <div
+                className="h-full rounded-full bg-blue-600 transition-all"
+                style={{
+                  width: `${(ttsProgress.done / ttsProgress.total) * 100}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {audioUrls.length > 0 && (
           <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
             {chunkCount > 1 && (
               <p className="mb-3 text-xs text-slate-400">
-                긴 텍스트를 {chunkCount}개 구간으로 나눠 변환했습니다.
+                긴 텍스트를 {chunkCount}개 구간으로 나눠 변환했습니다. 재생 중:{" "}
+                {currentChunk + 1}/{chunkCount} 구간
               </p>
             )}
             <audio
               ref={audioRef}
-              src={audioUrl}
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
-              onEnded={() => setIsPlaying(false)}
+              onEnded={handleChunkEnded}
               className="hidden"
             />
 
@@ -459,14 +574,16 @@ export default function Home() {
               </div>
             </div>
 
-            {/* 다운로드 */}
-            <a
-              href={audioUrl}
-              download={downloadName}
-              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300 py-3 text-base font-semibold transition hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
-            >
-              ⬇️ MP3 다운로드
-            </a>
+            {/* 다운로드 (전체 청크 병합본) */}
+            {downloadUrl && (
+              <a
+                href={downloadUrl}
+                download={downloadName}
+                className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300 py-3 text-base font-semibold transition hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                ⬇️ MP3 다운로드
+              </a>
+            )}
           </div>
         )}
       </Section>
